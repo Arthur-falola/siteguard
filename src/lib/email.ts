@@ -2,6 +2,12 @@
 // NEVER claim an email was sent when it was not: without RESEND_API_KEY
 // this returns { sent: false } with an explicit reason, and callers must
 // surface that honestly instead of pretending the email went out.
+//
+// Default sender is Resend's test sender (onboarding@resend.dev), which
+// works without a verified domain but only delivers to the Resend account
+// owner's address. To send from your own domain, set RESEND_FROM_EMAIL and
+// verify that domain in the Resend dashboard first — Resend rejects mail
+// from an unverified domain.
 
 export async function sendEmail(
   to: string,
@@ -16,7 +22,7 @@ export async function sendEmail(
     };
   }
 
-  const from = process.env.RESEND_FROM_EMAIL ?? 'SiteGuard <no-reply@siteguard.app>';
+  const from = process.env.RESEND_FROM_EMAIL ?? 'SiteGuard <onboarding@resend.dev>';
 
   try {
     const res = await fetch('https://api.resend.com/emails', {

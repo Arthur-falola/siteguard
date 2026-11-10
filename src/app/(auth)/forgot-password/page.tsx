@@ -4,8 +4,8 @@ import Link from "next/link";
 import { useState } from "react";
 import { Button, Card, Input, Label } from "@/components/ui";
 
-const HONEST_MESSAGE =
-  "If an account exists, a reset link was requested. Email delivery is not configured yet — contact support.";
+const FAILURE_MESSAGE =
+  "We couldn't send the reset email right now — please contact support.";
 
 export default function ForgotPasswordPage() {
   const [email, setEmail] = useState("");
@@ -56,7 +56,7 @@ export default function ForgotPasswordPage() {
             >
               {emailSent === true
                 ? "If an account exists for that email, a reset link has been sent. Check your inbox."
-                : HONEST_MESSAGE}
+                : FAILURE_MESSAGE}
             </p>
             <p className="mt-4 text-sm text-slate-500 dark:text-slate-400">
               <Link

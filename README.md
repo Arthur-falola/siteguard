@@ -68,7 +68,11 @@ invented monitoring results.**
    - `NEXT_PUBLIC_APP_URL` — the deployed URL, e.g.
      `https://siteguard-xxx.vercel.app` (used in password-reset links)
    - `RESEND_API_KEY` — optional; only if password-reset / alert emails
-     should actually be sent (Resend free tier works)
+     should actually be sent (Resend free tier works). Without a custom
+     `RESEND_FROM_EMAIL`, mail is sent from Resend's test sender
+     `onboarding@resend.dev`, which only delivers to the Resend account
+     owner's address; a custom sender requires verifying that domain in
+     Resend first.
 3. **GitHub repo + Vercel project — BLOCKED on permissions (10 Nov 2026)**:
    - GitHub: `create_repository` via the connected GitHub App returns
      `403 Resource not accessible by integration` — the App cannot create

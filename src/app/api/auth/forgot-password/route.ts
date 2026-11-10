@@ -21,6 +21,8 @@ function getClientIp(req: NextRequest): string {
 // Always returns { ok: true } — whether or not the email exists — so the
 // response never reveals if an account is registered for that address.
 // The reset token itself is NEVER returned in the response.
+// `sent` reports whether the reset email was actually sent (false when no
+// account exists, the DB/email is unconfigured, or sending failed).
 export async function POST(req: NextRequest): Promise<NextResponse> {
   if (!rateLimit(`forgot-password:${getClientIp(req)}`, 10, 60_000)) {
     return NextResponse.json(
@@ -44,11 +46,12 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
   }
 
   const { email } = parsed.data;
+  let emailSent = false;
   try {
     if (!isDbConfigured()) {
       // Nothing we can do without a database; still answer { ok: true }
       // so the endpoint never leaks account existence or DB state.
-      return NextResponse.json({ ok: true });
+      return NextResponse.json({ ok: true, sent: false });
     }
     const users = await query<{ id: string; email: string }>(
       'SELECT id, email FROM users WHERE email = $1',
@@ -72,6 +75,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
           `<p><a href="${resetLink}">Reset your password</a></p>` +
           `<p>This link expires in 24 hours. If you did not request this, you can ignore this email.</p>`,
       );
+      emailSent = result.sent;
       if (!result.sent) {
         // Honest server-side record; the response stays { ok: true } so
         // account existence is not leaked. The UI must tell the user the
@@ -82,5 +86,5 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
   } catch (err) {
     console.error('Forgot-password error:', err);
   }
-  return NextResponse.json({ ok: true });
+  return NextResponse.json({ ok: true, sent: emailSent });
 }
