@@ -198,15 +198,18 @@ export default async function ReportsPage({
                     {site.ssl_days_remaining != null
                       ? `${site.ssl_days_remaining} days remaining`
                       : "unknown remaining days"}
-                    ).
+                    ){site.ssl_issuer ? ` — issued by ${site.ssl_issuer}` : ""}.
                   </p>
                 ) : (
                   <p className="mt-2 text-sm text-slate-500 dark:text-slate-400">
-                    {site.ssl_error
-                      ? `SSL check reported an error: ${site.ssl_error}`
-                      : "No SSL information recorded yet."}
+                    No SSL information recorded yet.
                   </p>
                 )}
+                {site.ssl_error ? (
+                  <p className="mt-2 rounded-lg bg-amber-100 p-2 text-xs text-amber-800 dark:bg-amber-900/40 dark:text-amber-300">
+                    SSL warning: {site.ssl_error}
+                  </p>
+                ) : null}
               </Card>
 
               <Card className="p-5">

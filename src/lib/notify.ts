@@ -42,9 +42,16 @@ export async function recordCheckAndIncidents(
   website: WebsiteForCheck,
   result: CheckResult,
 ): Promise<{ checkId: string; status: string }> {
+  // Additive columns introduced by migration 002 (ssl_issuer,
+  // failure_kind). Applied idempotently here so a deployment that has
+  // not run the migration yet keeps working — never a breaking change,
+  // and a no-op once the columns exist.
+  await query(`ALTER TABLE checks ADD COLUMN IF NOT EXISTS failure_kind text`);
+  await query(`ALTER TABLE websites ADD COLUMN IF NOT EXISTS ssl_issuer text`);
+
   const checkRows = await query<{ id: string }>(
-    'INSERT INTO checks (website_id, status_code, response_time_ms, ok, error) VALUES ($1, $2, $3, $4, $5) RETURNING id',
-    [website.id, result.statusCode, result.responseTimeMs, result.ok, result.error],
+    'INSERT INTO checks (website_id, status_code, response_time_ms, ok, error, failure_kind) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id',
+    [website.id, result.statusCode, result.responseTimeMs, result.ok, result.error, result.failureKind],
   );
   const checkId = checkRows[0]?.id ?? '';
 
@@ -56,8 +63,8 @@ export async function recordCheckAndIncidents(
     `UPDATE websites
        SET status = $1, last_status_code = $2, last_response_time_ms = $3,
            last_checked_at = now(), ssl_expires_at = $4, ssl_days_remaining = $5,
-           ssl_error = $6, updated_at = now()
-     WHERE id = $7`,
+           ssl_error = $6, ssl_issuer = $7, updated_at = now()
+     WHERE id = $8`,
     [
       newStatus,
       result.statusCode,
@@ -65,6 +72,7 @@ export async function recordCheckAndIncidents(
       result.ssl.expiresAt,
       result.ssl.daysRemaining,
       result.ssl.error,
+      result.ssl.issuer,
       website.id,
     ],
   );

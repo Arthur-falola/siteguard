@@ -7,13 +7,40 @@
 // Redirects are followed manually (max 3) and every redirect target is
 // re-validated, so a public URL cannot bounce the fetch onto an internal
 // address (e.g. 169.254.169.254, the cloud metadata endpoint).
+//
+// Uptime and certificate health are reported INDEPENDENTLY:
+// - The HTTP probe uses a raw http/https request whose TLS handshake does
+//   NOT reject untrusted certificates (rejectUnauthorized: false). A site
+//   that answers HTTP is "up" even if its certificate is broken; the
+//   certificate problem is reported separately as an SSL warning. The
+//   probe sends no credentials, so skipping cert validation here leaks
+//   nothing — it only reads a public status page.
+// - The SSL probe (getSslInfo) verifies the certificate chain itself and
+//   reports issuer, expiry and plain-language warnings.
+//
+// Failure causes are classified (dns / tcp / tls / timeout / http_error /
+// validation) and surfaced ONLY as curated plain-English messages. Raw
+// Node.js/undici error text is never shown to users — it can contain
+// runtime internals (e.g. hints about running Node with --use-system-ca)
+// that mean nothing to a freelancer checking a client's site.
 
+import http from 'node:http';
+import https from 'node:https';
 import { lookup } from 'node:dns/promises';
 import { isIP } from 'node:net';
 import tls from 'node:tls';
 
+export type CheckFailureKind =
+  | 'dns'
+  | 'tcp'
+  | 'tls'
+  | 'timeout'
+  | 'http_error'
+  | 'validation';
+
 export interface SslInfo {
   valid: boolean | null;
+  issuer: string | null;
   expiresAt: Date | null;
   daysRemaining: number | null;
   error: string | null;
@@ -23,6 +50,7 @@ export interface CheckResult {
   ok: boolean;
   statusCode: number | null;
   responseTimeMs: number | null;
+  failureKind: CheckFailureKind | null;
   error: string | null;
   ssl: SslInfo;
 }
@@ -32,7 +60,13 @@ const SSL_TIMEOUT_MS = 10_000;
 const MAX_REDIRECTS = 3;
 
 function emptySsl(): SslInfo {
-  return { valid: null, expiresAt: null, daysRemaining: null, error: null };
+  return {
+    valid: null,
+    issuer: null,
+    expiresAt: null,
+    daysRemaining: null,
+    error: null,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -222,7 +256,59 @@ export async function validatePublicUrl(raw: string): Promise<URL> {
 // SSL check
 // ---------------------------------------------------------------------------
 
-async function getSslInfo(url: URL): Promise<SslInfo> {
+/** Plain-language explanation of a certificate verification failure.
+ * `authorizationError` is typed as Error by @types/node, but at runtime
+ * Node hands back the bare verification code string (e.g.
+ * "DEPTH_ZERO_SELF_SIGNED_CERT") — handle both shapes. */
+function describeCertProblem(
+  authorizationError: unknown,
+  expired: boolean,
+): string {
+  if (expired) return 'The certificate has expired.';
+  const code =
+    typeof authorizationError === 'string'
+      ? authorizationError
+      : ((authorizationError as NodeJS.ErrnoException | undefined)?.code ?? '');
+  switch (code) {
+    case 'UNABLE_TO_VERIFY_LEAF_SIGNATURE':
+      return 'The certificate chain is incomplete — the server did not send the intermediate certificate(s) needed to verify it.';
+    case 'DEPTH_ZERO_SELF_SIGNED_CERT':
+    case 'SELF_SIGNED_CERT_IN_CHAIN':
+      return 'The certificate is self-signed and cannot be verified against a trusted authority.';
+    case 'ERR_TLS_CERT_ALTNAME_INVALID':
+      return 'The certificate does not cover this hostname.';
+    case 'CERT_NOT_YET_VALID':
+      return 'The certificate is not valid yet.';
+    case 'CERT_HAS_EXPIRED':
+      return 'The certificate has expired.';
+    case 'UNABLE_TO_GET_ISSUER_CERT':
+    case 'UNABLE_TO_GET_ISSUER_CERT_LOCALLY':
+      return 'The certificate could not be verified — its issuer is not recognised.';
+    default:
+      return 'The certificate could not be verified against a trusted authority.';
+  }
+}
+
+function readIssuer(
+  cert: tls.PeerCertificate & { issuer?: { CN?: string; O?: string } | string },
+): string | null {
+  const issuer = cert.issuer;
+  if (!issuer) return null;
+  if (typeof issuer === 'string') return issuer || null;
+  return issuer.CN ?? issuer.O ?? null;
+}
+
+/**
+ * Read a site's TLS certificate: issuer, expiry, days remaining, and
+ * whether the chain verifies. The handshake deliberately does NOT reject
+ * untrusted chains (rejectUnauthorized: false) so the certificate can
+ * still be read — and reported in plain language — when the chain is
+ * incomplete or untrusted. `socket.authorized` /
+ * `socket.authorizationError` tell us whether verification succeeded.
+ * Transport errors are mapped to plain messages; raw error text is
+ * never surfaced.
+ */
+export async function getSslInfo(url: URL): Promise<SslInfo> {
   const hostname = url.hostname.replace(/^\[|\]$/g, '');
   const port = url.port ? Number(url.port) : 443;
   const isIpLiteral = isIP(hostname) !== 0;
@@ -237,6 +323,7 @@ async function getSslInfo(url: URL): Promise<SslInfo> {
     };
     const fail = (message: string): SslInfo => ({
       valid: false,
+      issuer: null,
       expiresAt: null,
       daysRemaining: null,
       error: message,
@@ -249,48 +336,60 @@ async function getSslInfo(url: URL): Promise<SslInfo> {
         port,
         // SNI only for real hostnames, never for IP literals.
         servername: isIpLiteral ? undefined : hostname,
+        rejectUnauthorized: false,
         timeout: SSL_TIMEOUT_MS,
       });
-    } catch (err) {
-      done(fail(err instanceof Error ? err.message : 'SSL connection failed'));
+    } catch {
+      done(fail('The secure connection could not be established.'));
       return;
     }
 
     socket.setTimeout(SSL_TIMEOUT_MS);
     socket.once('secureConnect', () => {
-      const cert = socket.getPeerCertificate();
+      const cert = socket.getPeerCertificate() as tls.PeerCertificate & {
+        issuer?: { CN?: string; O?: string } | string;
+      };
       const validToRaw = (cert as { valid_to?: unknown } | null)?.valid_to;
-      if (typeof validToRaw !== 'string') {
+      if (typeof validToRaw !== 'string' || !cert || Object.keys(cert).length === 0) {
         socket.destroy();
-        done(fail('No peer certificate presented'));
+        done(fail('The server did not present a certificate.'));
         return;
       }
       const expiresAt = new Date(validToRaw);
       if (Number.isNaN(expiresAt.getTime())) {
         socket.destroy();
-        done(fail(`Could not parse certificate expiry: ${validToRaw}`));
+        done(fail('The certificate expiry date could not be read.'));
         return;
       }
       const daysRemaining = Math.floor((expiresAt.getTime() - Date.now()) / 86_400_000);
       const expired = expiresAt.getTime() <= Date.now();
-      const valid = Boolean(socket.authorized) && !expired;
+      const authorized = Boolean(socket.authorized);
+      const valid = authorized && !expired;
+      const authorizationError = socket.authorizationError;
       socket.destroy();
       done({
         valid,
+        issuer: readIssuer(cert),
         expiresAt,
         daysRemaining,
-        error: expired
-          ? 'Certificate has expired'
-          : !socket.authorized
-            ? (socket.authorizationError?.message ?? 'Certificate is not trusted')
-            : null,
+        error: valid
+          ? null
+          : describeCertProblem(authorizationError, expired),
       });
     });
     socket.once('timeout', () => {
-      socket.destroy(new Error('SSL check timed out'));
+      socket.destroy();
+      done(fail('The SSL check timed out.'));
     });
     socket.once('error', (err) => {
-      done(fail(err.message));
+      const code = (err as NodeJS.ErrnoException).code ?? '';
+      if (code === 'ENOTFOUND' || code === 'EAI_AGAIN') {
+        done(fail('The hostname could not be resolved (DNS lookup failed).'));
+      } else if (code === 'ECONNREFUSED') {
+        done(fail('The server refused the connection.'));
+      } else {
+        done(fail('The secure connection could not be established.'));
+      }
       try {
         socket.destroy();
       } catch {
@@ -301,24 +400,140 @@ async function getSslInfo(url: URL): Promise<SslInfo> {
 }
 
 // ---------------------------------------------------------------------------
+// HTTP probe (raw http/https — see the header note on why not fetch)
+// ---------------------------------------------------------------------------
+
+export interface ProbeLeg {
+  statusCode: number | null;
+  responseTimeMs: number;
+  failureKind: CheckFailureKind | null;
+  error: string | null;
+  location: string | null;
+}
+
+/** One request, no redirect following. Only the status code and the
+ * `location` header are recorded; the body is discarded immediately. */
+export function requestOnce(url: URL, startedAt: number): Promise<ProbeLeg> {
+  return new Promise((resolve) => {
+    const isHttps = url.protocol === 'https:';
+    const hostname = url.hostname.replace(/^\[|\]$/g, '');
+    const isIpLiteral = isIP(hostname) !== 0;
+    let settled = false;
+    let tlsEstablished = false;
+    let timedOut = false;
+
+    const done = (leg: ProbeLeg) => {
+      if (!settled) {
+        settled = true;
+        resolve(leg);
+      }
+    };
+    const fail = (kind: CheckFailureKind, message: string) => {
+      done({
+        statusCode: null,
+        responseTimeMs: Date.now() - startedAt,
+        failureKind: kind,
+        error: message,
+        location: null,
+      });
+    };
+
+    const options: https.RequestOptions = {
+      method: 'GET',
+      // See the header note: certificate validation lives in the SSL
+      // probe, so a broken certificate never turns into a false "down".
+      rejectUnauthorized: false,
+      servername: isHttps && !isIpLiteral ? hostname : undefined,
+      headers: {
+        'user-agent': 'SiteGuard/1.0 (website health monitor)',
+        accept: '*/*',
+      },
+    };
+
+    let req: http.ClientRequest;
+    try {
+      const get = (isHttps ? https.get : http.get) as typeof https.get;
+      req = get(url.toString(), options, (res) => {
+        const statusCode = res.statusCode ?? 0;
+        const location =
+          typeof res.headers.location === 'string' ? res.headers.location : null;
+        // Status only — discard the body and finish immediately.
+        res.once('error', () => {
+          // Body errors after headers are irrelevant to the verdict.
+        });
+        res.destroy();
+        done({
+          statusCode,
+          responseTimeMs: Date.now() - startedAt,
+          failureKind: null,
+          error: null,
+          location,
+        });
+      });
+    } catch {
+      fail('tcp', 'The site could not be reached.');
+      return;
+    }
+
+    req.on('socket', (socket) => {
+      if (isHttps) {
+        (socket as unknown as tls.TLSSocket).once('secureConnect', () => {
+          tlsEstablished = true;
+        });
+      }
+    });
+    req.setTimeout(FETCH_TIMEOUT_MS);
+    req.once('timeout', () => {
+      timedOut = true;
+      req.destroy(new Error('Request timed out'));
+    });
+    req.once('error', (err) => {
+      // Only the error CODE is used — never the raw message, which can
+      // contain runtime internals (e.g. Node.js hints) users should
+      // never see.
+      const code = (err as NodeJS.ErrnoException).code ?? '';
+      const message = err.message ?? '';
+      if (timedOut || code === 'ETIMEDOUT' || code === 'ECONNABORTED') {
+        fail('timeout', 'The site did not respond within 10 seconds.');
+      } else if (code === 'ENOTFOUND' || code === 'EAI_AGAIN') {
+        fail('dns', 'The hostname could not be resolved (DNS lookup failed).');
+      } else if (code === 'ECONNREFUSED') {
+        fail('tcp', 'The server refused the connection.');
+      } else if (
+        code === 'ECONNRESET' ||
+        code === 'EPIPE' ||
+        message.includes('socket hang up')
+      ) {
+        fail(
+          'tcp',
+          tlsEstablished
+            ? 'The server accepted the secure connection but sent no response.'
+            : 'The connection was closed before the site sent a response.',
+        );
+      } else if (
+        code.startsWith('ERR_SSL') ||
+        code.startsWith('CERT_') ||
+        message.includes('certificate')
+      ) {
+        fail('tls', 'The secure connection could not be established.');
+      } else {
+        fail('tcp', 'The site could not be reached.');
+      }
+    });
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Website check
 // ---------------------------------------------------------------------------
 
-async function cancelBody(res: Response): Promise<void> {
-  if (res.body) {
-    try {
-      await res.body.cancel();
-    } catch {
-      // Body already consumed/closed — nothing to do.
-    }
-  }
-}
-
 /**
- * Check a website: HTTP fetch (10s timeout, manual redirects, max 3) plus
- * an SSL certificate check for https URLs. Never throws for a bad URL or
- * a failed fetch — those come back as { ok: false, error } instead.
- * A site is "up" when the final response is 2xx/3xx.
+ * Check a website: HTTP probe (10s timeout, manual redirects, max 3)
+ * plus an SSL certificate check for https URLs. Never throws for a bad
+ * URL or a failed probe — those come back as { ok: false, failureKind,
+ * error } instead. A site is "up" when the final response is 2xx/3xx.
+ * A certificate problem never makes a site "down" — it is reported
+ * separately in `ssl` as a warning.
  */
 export async function checkWebsite(rawUrl: string): Promise<CheckResult> {
   const startedAt = Date.now();
@@ -331,6 +546,7 @@ export async function checkWebsite(rawUrl: string): Promise<CheckResult> {
       ok: false,
       statusCode: null,
       responseTimeMs: null,
+      failureKind: 'validation',
       error: err instanceof Error ? err.message : 'Invalid URL',
       ssl: emptySsl(),
     };
@@ -339,59 +555,62 @@ export async function checkWebsite(rawUrl: string): Promise<CheckResult> {
   let currentUrl = initialUrl;
   let statusCode: number | null = null;
   let responseTimeMs: number | null = null;
+  let failureKind: CheckFailureKind | null = null;
   let error: string | null = null;
 
-  try {
-    let redirects = 0;
-    for (;;) {
-      const res = await fetch(currentUrl.toString(), {
-        method: 'GET',
-        redirect: 'manual',
-        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-      });
-      responseTimeMs = Date.now() - startedAt;
-      statusCode = res.status;
-
-      const location = res.headers.get('location');
-      if (res.status >= 300 && res.status < 400 && location) {
-        await cancelBody(res);
-        if (redirects >= MAX_REDIRECTS) {
-          error = `Too many redirects (max ${MAX_REDIRECTS})`;
-          break;
-        }
-        redirects += 1;
-        try {
-          // Re-validate every redirect target — a public URL must not be
-          // able to bounce the check onto an internal address.
-          currentUrl = await validatePublicUrl(new URL(location, currentUrl).toString());
-        } catch (err) {
-          error = err instanceof Error ? err.message : 'Invalid redirect URL';
-          statusCode = null;
-          break;
-        }
-        continue;
-      }
-
-      await cancelBody(res);
+  let redirects = 0;
+  for (;;) {
+    const leg = await requestOnce(currentUrl, startedAt);
+    responseTimeMs = leg.responseTimeMs;
+    if (leg.failureKind !== null) {
+      failureKind = leg.failureKind;
+      error = leg.error;
+      statusCode = null;
       break;
     }
-  } catch (err) {
-    if (responseTimeMs === null) {
-      responseTimeMs = Date.now() - startedAt;
+    statusCode = leg.statusCode;
+
+    const location = leg.location;
+    if (statusCode !== null && statusCode >= 300 && statusCode < 400 && location) {
+      if (redirects >= MAX_REDIRECTS) {
+        failureKind = 'http_error';
+        error = `Too many redirects (max ${MAX_REDIRECTS})`;
+        break;
+      }
+      redirects += 1;
+      try {
+        // Re-validate every redirect target — a public URL must not be
+        // able to bounce the check onto an internal address.
+        currentUrl = await validatePublicUrl(new URL(location, currentUrl).toString());
+      } catch (err) {
+        failureKind = 'validation';
+        error = err instanceof Error ? err.message : 'Invalid redirect URL';
+        statusCode = null;
+        break;
+      }
+      continue;
     }
-    error = err instanceof Error ? err.message : 'Check failed';
-    statusCode = null;
+    break;
   }
 
-  // SSL is checked on the host that actually served the final response.
+  // SSL is checked on the host that actually served the final response,
+  // independently of the HTTP outcome.
   const ssl = currentUrl.protocol === 'https:' ? await getSslInfo(currentUrl) : emptySsl();
 
-  const ok = error === null && statusCode !== null && statusCode >= 200 && statusCode < 400;
+  const httpOk =
+    failureKind === null && statusCode !== null && statusCode >= 200 && statusCode < 400;
+  if (!httpOk && failureKind === null && statusCode !== null) {
+    // HTTP error status (4xx/5xx) with no transport failure.
+    failureKind = 'http_error';
+    error = `The site returned HTTP ${statusCode}.`;
+  }
+
   return {
-    ok,
+    ok: httpOk,
     statusCode,
     responseTimeMs,
-    error: ok ? null : (error ?? `HTTP ${statusCode}`),
+    failureKind,
+    error: httpOk ? null : error,
     ssl,
   };
 }

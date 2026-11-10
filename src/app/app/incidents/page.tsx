@@ -32,7 +32,9 @@ export default async function IncidentsPage({
   try {
     [openIncidents, history] = await Promise.all([
       query<IncidentRow>(
-        `SELECT i.*, w.name AS website_name, w.url AS website_url
+        `SELECT i.*, w.name AS website_name, w.url AS website_url,
+                COALESCE(i.duration_seconds,
+                  EXTRACT(EPOCH FROM (now() - i.started_at)))::int AS duration_seconds
          FROM incidents i JOIN websites w ON w.id = i.website_id
          WHERE i.user_id = $1 AND i.status = 'open'
          ORDER BY i.started_at DESC`,

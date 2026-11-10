@@ -74,7 +74,7 @@ export default function SiteTable({
                 {site.ssl_days_remaining != null
                   ? `${site.ssl_days_remaining} days left`
                   : site.ssl_error
-                    ? "Error"
+                    ? "Warning"
                     : "—"}
               </td>
               {actions ? (

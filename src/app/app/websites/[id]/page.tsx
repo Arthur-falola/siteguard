@@ -151,21 +151,35 @@ export default async function SiteDetailPage({
 
         <Card className="p-5">
           <h2 className="text-base font-semibold">SSL certificate</h2>
-          {site.ssl_expires_at ? (
+          {site.ssl_expires_at || site.ssl_issuer || site.ssl_error ? (
             <dl className="mt-3 space-y-2 text-sm">
-              <div className="flex justify-between gap-2">
-                <dt className="text-slate-500 dark:text-slate-400">Expires</dt>
-                <dd className="font-medium">{formatDateTime(site.ssl_expires_at)}</dd>
-              </div>
-              <div className="flex justify-between gap-2">
-                <dt className="text-slate-500 dark:text-slate-400">Days remaining</dt>
-                <dd className="font-medium">
-                  {site.ssl_days_remaining != null
-                    ? `${site.ssl_days_remaining} days`
-                    : "—"}
-                </dd>
-              </div>
-              {site.ssl_days_remaining != null && site.ssl_days_remaining <= 14 ? (
+              {site.ssl_issuer ? (
+                <div className="flex justify-between gap-2">
+                  <dt className="text-slate-500 dark:text-slate-400">Issued by</dt>
+                  <dd className="text-right font-medium">{site.ssl_issuer}</dd>
+                </div>
+              ) : null}
+              {site.ssl_expires_at ? (
+                <>
+                  <div className="flex justify-between gap-2">
+                    <dt className="text-slate-500 dark:text-slate-400">Expires</dt>
+                    <dd className="font-medium">{formatDateTime(site.ssl_expires_at)}</dd>
+                  </div>
+                  <div className="flex justify-between gap-2">
+                    <dt className="text-slate-500 dark:text-slate-400">Days remaining</dt>
+                    <dd className="font-medium">
+                      {site.ssl_days_remaining != null
+                        ? `${site.ssl_days_remaining} days`
+                        : "—"}
+                    </dd>
+                  </div>
+                </>
+              ) : null}
+              {site.ssl_error ? (
+                <p className="rounded-lg bg-amber-100 p-2 text-xs text-amber-800 dark:bg-amber-900/40 dark:text-amber-300">
+                  SSL warning: {site.ssl_error}
+                </p>
+              ) : site.ssl_days_remaining != null && site.ssl_days_remaining <= 14 ? (
                 <p className="rounded-lg bg-amber-100 p-2 text-xs text-amber-800 dark:bg-amber-900/40 dark:text-amber-300">
                   SSL certificate expires soon — renew it before it lapses.
                 </p>
@@ -173,9 +187,7 @@ export default async function SiteDetailPage({
             </dl>
           ) : (
             <p className="mt-3 text-sm text-slate-500 dark:text-slate-400">
-              {site.ssl_error
-                ? `SSL check reported an error: ${site.ssl_error}`
-                : "No SSL information yet. SSL is checked for HTTPS sites on the next check."}
+              No SSL information yet. SSL is checked for HTTPS sites on the next check.
             </p>
           )}
         </Card>

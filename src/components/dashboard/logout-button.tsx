@@ -1,11 +1,9 @@
 "use client";
 
-import { useRouter } from "next/navigation";
 import { useState } from "react";
 import { Button } from "@/components/ui";
 
 export default function LogoutButton() {
-  const router = useRouter();
   const [pending, setPending] = useState(false);
 
   async function onLogout() {
@@ -15,8 +13,12 @@ export default function LogoutButton() {
     } catch {
       // Even if the call fails, drop the local session view.
     } finally {
-      router.push("/login");
-      router.refresh();
+      // Hard navigation, not router.push(): a soft navigation can leave
+      // the dashboard layout in the client router cache, and signing
+      // back in restores this button with its stale "Logging out…"
+      // state. A full reload drops that cached state entirely.
+      setPending(false);
+      window.location.assign("/login");
     }
   }
 

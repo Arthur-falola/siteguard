@@ -12,6 +12,7 @@ export interface WebsiteRow {
   ssl_expires_at: string | null;
   ssl_days_remaining: number | null;
   ssl_error: string | null;
+  ssl_issuer: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -23,6 +24,7 @@ export interface CheckRow {
   response_time_ms: number | null;
   ok: boolean;
   error: string | null;
+  failure_kind: string | null;
   checked_at: string;
   website_name?: string;
   website_url?: string;
