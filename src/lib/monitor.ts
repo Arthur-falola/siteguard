@@ -21,8 +21,8 @@
 // Failure causes are classified (dns / tcp / tls / timeout / http_error /
 // validation) and surfaced ONLY as curated plain-English messages. Raw
 // Node.js/undici error text is never shown to users — it can contain
-// runtime internals (e.g. hints about running Node with --use-system-ca)
-// that mean nothing to a freelancer checking a client's site.
+// runtime internals (e.g. hints about runtime flags) that mean nothing
+// to a freelancer checking a client's site.
 
 import http from 'node:http';
 import https from 'node:https';
