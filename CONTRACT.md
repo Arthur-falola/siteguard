@@ -1,0 +1,49 @@
+# SiteGuard — Build Contract (read first, follow exactly)
+
+App root: `~/workspace/siteguard-app`. Stack: Next.js 16 App Router, React 19, TypeScript, Tailwind CSS v4, `pg`, `bcryptjs`, `jose`, `zod`, `recharts`. No Prisma (engine downloads fail in this sandbox). English UI only.
+
+## Design system
+- Tailwind v4. In `globals.css` add `@custom-variant dark (&:where(.dark, .dark *));` for class-based dark mode.
+- Accent: indigo/violet (#4f46e5 family). Status: green operational, red down, amber warning. Deep navy/near-black dark surfaces, white/soft-grey light surfaces. Inter via `next/font/google` with system fallback.
+- Theme toggle: `document.documentElement.classList` + `localStorage` (`siteguard-theme`), default = system preference.
+- Shared primitives live in `src/components/ui.tsx` (Agent A owns it; others import from it): `Button`, `Card`, `Badge`, `Input`, `Label`, `EmptyState`, `Spinner`, `StatCard`, `StatusDot`.
+
+## Database (PostgreSQL, `pg` driver, SQL migrations)
+Tables (migration `db/migrations/001_init.sql`, Agent B owns):
+- `users(id uuid PK default gen_random_uuid(), email text UNIQUE NOT NULL, password_hash text NOT NULL, name text NOT NULL, plan text NOT NULL DEFAULT 'free', created_at timestamptz DEFAULT now(), updated_at timestamptz DEFAULT now(), reset_token_hash text, reset_token_expires_at timestamptz)`
+- `websites(id uuid PK, user_id uuid REFERENCES users(id) ON DELETE CASCADE, name text NOT NULL, url text NOT NULL, check_interval_minutes int NOT NULL DEFAULT 60, is_active boolean NOT NULL DEFAULT true, status text NOT NULL DEFAULT 'unknown', last_status_code int, last_response_time_ms int, last_checked_at timestamptz, ssl_expires_at timestamptz, ssl_days_remaining int, ssl_error text, created_at, updated_at)` — index on (user_id), (user_id, status)
+- `checks(id uuid PK, website_id uuid REFERENCES websites(id) ON DELETE CASCADE, status_code int, response_time_ms int, ok boolean NOT NULL, error text, checked_at timestamptz DEFAULT now())` — index (website_id, checked_at DESC)
+- `incidents(id uuid PK, website_id uuid REFERENCES websites(id) ON DELETE CASCADE, user_id uuid REFERENCES users(id) ON DELETE CASCADE, started_at timestamptz NOT NULL DEFAULT now(), resolved_at timestamptz, duration_seconds int, status text NOT NULL DEFAULT 'open', cause text)` — partial unique index: one open incident per website (`WHERE status='open'`)
+- `notifications(id uuid PK, user_id uuid REFERENCES users(id) ON DELETE CASCADE, website_id uuid REFERENCES websites(id) ON DELETE SET NULL, type text NOT NULL, title text NOT NULL, message text NOT NULL, is_read boolean NOT NULL DEFAULT false, created_at timestamptz DEFAULT now())`
+- `subscriptions(id uuid PK, user_id uuid REFERENCES users(id) ON DELETE CASCADE, plan text NOT NULL, status text NOT NULL DEFAULT 'inactive', current_period_end timestamptz, created_at timestamptz DEFAULT now())` — future billing placeholder only.
+- Enable `pgcrypto` for `gen_random_uuid()`. Use `gen_random_uuid()` defaults so app code never generates UUIDs by hand.
+- Plans: `free` = 1 site, 7 days history; `starter` = 5 sites, 30 days; `pro` = 20 sites, 90 days. Prices are launch hypotheses, NO payments.
+
+## Shared lib contracts (Agent B owns; Agents A/C import, never redefine)
+- `src/lib/db.ts`: exports `pool: Pool | null` (null when `DATABASE_URL` unset), `isDbConfigured(): boolean`, `query<T>(text: string, params?: unknown[]): Promise<T[]>` — throws `DbNotConfiguredError` (export the class) when no DATABASE_URL. All queries parameterised. Every query on user data MUST filter `user_id = $x`.
+- `src/lib/auth.ts`: exports `hashPassword(pw)`, `verifyPassword(pw, hash)`, `createSessionToken(userId: string): Promise<string>` (jose HS256, 7-day expiry, `SESSION_SECRET` env; if unset, throw — never a hardcoded production secret), `setSessionCookie(token)`, `clearSessionCookie()`, `getSessionUser(): Promise<{id,email,name,plan} | null>` (reads `siteguard_session` cookie, verifies JWT), `requireUser()` (redirects to `/login` when null). Session cookie: httpOnly, secure in production, sameSite=lax, path=/.
+- `src/lib/monitor.ts`: exports `validatePublicUrl(raw: string): URL` (throws Error with clear message on: non http/https, localhost, `*.local`, private/loopback/link-local/reserved IP ranges after DNS resolution via `dns/promises` lookup, IP-literal hosts in those ranges; follows max 3 redirects, each re-validated), `checkWebsite(rawUrl: string): Promise<CheckResult>` where `CheckResult = { ok: boolean; statusCode: number | null; responseTimeMs: number | null; error: string | null; ssl: { valid: boolean | null; expiresAt: Date | null; daysRemaining: number | null; error: string | null } }`. Use `fetch` with 10s AbortSignal timeout, `redirect: 'manual'` + manual redirect handling. SSL via `tls.connect` (10s timeout) reading `peerCertificate.valid_to`; non-HTTPS → ssl all null. Never fetch internal/metadata addresses (169.254.0.0/16 etc.).
+- `src/lib/plans.ts`: `PLAN_LIMITS = { free: { sites: 1, historyDays: 7, label: 'Free' }, starter: { sites: 5, historyDays: 30, label: 'Starter' }, pro: { sites: 20, historyDays: 90, label: 'Pro' } }`, `canAddSite(plan, currentCount): boolean`.
+- `src/lib/rate-limit.ts`: in-memory sliding-window `rateLimit(key: string, limit: number, windowMs: number): boolean` (true = allowed).
+- `src/lib/email.ts`: `sendEmail(to, subject, html): Promise<{sent: boolean; reason: string}>` — returns `{sent:false, reason:'No email provider configured (set RESEND_API_KEY …)'}` unless `RESEND_API_KEY` is set (then use Resend HTTP API). NEVER claim an email was sent when it was not.
+- `src/lib/notify.ts` (Agent B): `createNotification(userId, websiteId, type, title, message)` inserts a row; `recordCheckAndIncidents(website, result)` — inserts a `checks` row, updates website status/last_* /ssl fields, opens an incident (status='open') on transition to down if none open (and creates a 'site_down' notification), resolves the open incident on recovery (sets resolved_at, duration_seconds, creates 'site_recovered' notification), creates an 'ssl_expiring' notification when ssl.daysRemaining <= 14 and no unread one exists for that site in the last 24h. Export both.
+- `src/lib/utils.ts` (Agent A or C, whoever needs first — put in A): `formatDuration`, `formatRelativeTime`, `uptimePct(checks)`, `cn(...)`.
+
+## Routes
+- Public: `/` (landing), `/login`, `/register`, `/forgot-password`, `/reset-password?token=…`, `/pricing` (anchor on landing is fine; separate page optional), API: `/api/auth/*`, `/api/cron/check` (GET, requires `Authorization: Bearer $CRON_SECRET` OR Vercel cron header; if CRON_SECRET unset, allow only in development), `/api/sites/[id]/check` (POST, auth required, rate-limited, triggers one manual check via recordCheckAndIncidents).
+- Protected (middleware): `/app/*` and `/api/sites/*`, `/api/incidents/*`, `/api/notifications/*`. `middleware.ts` (Agent B): protects `/app/:path*`, redirects unauthenticated to `/login`; nothing else.
+- Dashboard (Agent C): `/app` (Overview), `/app/websites`, `/app/websites/[id]`, `/app/incidents`, `/app/reports`, `/app/settings`, `/app/account`. Sidebar nav exactly: Overview, Websites, Incidents, Reports, Settings, Account. Layout in `src/app/app/layout.tsx` with sidebar + topbar + mobile nav.
+- Auth pages (Agent C): `/login`, `/register`, `/forgot-password`, `/reset-password` — server actions calling Agent B's lib; password reset: generate random token, store SHA-256 hash + 24h expiry in users table, email via `sendEmail` (will report not-configured); if email not configured, show an honest message that reset email could not be sent and to contact support — NEVER display the token on screen.
+
+## Honesty rules (non-negotiable)
+- No fake monitoring results, no fake users, no fake testimonials/customer numbers. Landing preview dashboard must be labelled "Illustrative preview — sample data".
+- When `DATABASE_URL` is unset, dashboard pages render an honest "Database not connected" state listing the env vars needed (DATABASE_URL, SESSION_SECRET, CRON_SECRET) instead of fake data or a crash.
+- Cron: `vercel.json` cron `0 8 * * *` → `/api/cron/check`. Landing/pricing must state monitoring runs once daily on the Free/Hobby setup (do not claim 1-min or 5-min monitoring).
+- Plan limits enforced in API routes (count sites for the user before insert), not just UI.
+
+## Process rules for subagents
+- Edit ONLY your assigned files. Do not touch other agents' files. Do not run `git push`. Do not install new packages without listing them in your report (deps are already installed: next, react, pg, bcryptjs, jose, zod, recharts).
+- TypeScript strict. Use `zod` for all server-side input validation. No `any` without justification. No secrets in code.
+- **Next.js 16 notes:** `params` and `searchParams` in pages/routes are Promises — always `await` them. `cookies()` and `headers()` from `next/headers` are async — always `await`. Route handlers use `export async function GET/POST(req: NextRequest)`. Middleware uses `NextResponse` from `next/server`.
+- At the end of your slice run `npx tsc --noEmit` and report errors honestly (a full `npm run build` may fail until all slices land — that is expected; report only YOUR files' type errors).
+- Report back: files created/modified, key decisions, anything you could not implement, and exact deviations from this contract.
